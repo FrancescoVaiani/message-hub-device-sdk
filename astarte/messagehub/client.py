@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from collections.abc import Callable
 from threading import Thread, Event
 
 import grpc
 
-# pylint: disable=import-error
+from astarte.messagehub import utils
+from astarte.messagehub.introspection import Introspection
+
 from astarteplatform.msghub import message_hub_service_pb2_grpc as message_hub
 from astarteplatform.msghub import node_pb2 as node
 from astarteplatform.msghub import astarte_message_pb2 as astarte_message
-
-# pylint: enable=import-error
+from astarteplatform.msghub import astarte_type_pb2 as astarte_type
+from google.protobuf import timestamp_pb2 as _timestamp_pb2
 
 
 class Client:
@@ -46,21 +49,15 @@ class Client:
         if not self.__interfaces_dir.is_dir():
             raise NotADirectoryError(f'"{self.__interfaces_dir}" is not a directory')
 
-    def interfaces_to_bytearray(self) -> list[bytes]:
-        """
-        Function that retrieves all the json files from the interfaces directory and get the
-        content as bytes.
+        self.__introspection = Introspection()
+        self.__load_introspection()
 
-        Returns
-        -------
-        list[bytes]
-            A list of all the interfaces' JSON read as bytes
+    def __load_introspection(self):
         """
-        result = []
+        Function to load all the .json interface files located in `interface_dir`
+        """
         for interface_file in [i for i in self.__interfaces_dir.iterdir() if i.suffix == ".json"]:
-            with open(interface_file, "r", encoding="utf-8") as interface_fp:
-                result.append(bytes(interface_fp.read()))
-        return result
+            self.__introspection.add_interface(interface_file)
 
     async def message_handler(self, grpc_channel: grpc, kill_switch: Event):
         """
@@ -95,7 +92,9 @@ class Client:
             The message hub port
 
         """
-        self.__node = node.Node(self.__client_id, self.interfaces_to_bytearray())
+        self.__node = node.Node(  # pylint: disable=no-member
+            self.__client_id, self.__introspection.get_raw()
+        )
         with grpc.insecure_channel(f"{address}:{port}") as channel:
             self.__stub = message_hub.MessageHubStub(channel)
             grpc_channel = self.__stub.Attach(self.__node)
@@ -112,3 +111,151 @@ class Client:
         self.__stub.Detach(self.__node)
         self.__node = None
         self.__message_handler_thread_kill_switch.set()
+
+    def send(
+        self,
+        interface_name: str,
+        interface_path: str,
+        payload: any,
+        timestamp: datetime | None = None,
+    ) -> None:
+        """
+        Sends an individual message to an interface.
+
+        Parameters
+        ----------
+        interface_name : str
+            The name of the Interface to send data to.
+        interface_path : str
+            The path of the Interface to send data to.
+        payload : object
+            The value to be sent. The type should be compatible to the one specified in the
+            interface path.
+        timestamp : datetime, optional
+            If sending a Datastream with explicit_timestamp, you can specify a datetime object
+            which will be registered as the timestamp for the value.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the interface not in the introspection or Mapping not in the interface.
+        TypeError
+            If the interface or the payload are not compatible.
+        """
+
+        interface = self.__introspection.get_interface(interface_name)
+        if not interface:
+            raise FileNotFoundError(f"Interface {interface_name} not found.")
+        if not interface.is_type_properties() and interface.is_aggregation_object():
+            raise TypeError(
+                f"Unable to send single data on {interface_name}. The interface is "
+                f"object aggregated."
+            )
+
+        mapping = interface.get_mapping(interface_path)
+        if not mapping:
+            raise FileNotFoundError(f"Mapping {interface_name}/{interface_path} not found.")
+
+        data_type = mapping.type
+
+        astarte_data = astarte_type.AstarteDataType(  # pylint: disable=no-member
+            astarte_individual=utils.__value_to_astarte_type(payload, data_type)
+        )
+
+        astarte_timestamp = None
+        if timestamp:
+            t = timestamp.timestamp()
+            seconds = int(t)
+            nanos = int(t % 1 * 1e9)
+            astarte_timestamp = _timestamp_pb2.Timestamp(seconds=seconds, nanos=nanos)
+
+        message = astarte_message.AstarteMessage(  # pylint: disable=no-member
+            interface_name=interface_name,
+            path=interface_path,
+            astarte_data=astarte_data,
+            timestamp=astarte_timestamp,
+        )
+        self.__stub.Send(message)
+
+    def send_aggregate(
+        self,
+        interface_name: str,
+        interface_path: str,
+        payload: dict,
+        timestamp: datetime | None = None,
+    ) -> None:
+        """
+        Sends an aggregate message to an interface
+
+        Parameters
+        ----------
+        interface_name : str
+            The name of the Interface to send data to.
+        interface_path: str
+            The endpoint to send the data to
+        payload : dict
+            A dictionary containing the path:value map for the aggregate.
+        timestamp : datetime, optional
+            If the Datastream has explicit_timestamp, you can specify a datetime object which
+            will be registered as the timestamp for the value.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the interface is not in the introspection.
+        TypeError
+            If the interface or the payload are not compatible.
+        """
+        data_object = {}
+        interface = self.__introspection.get_interface(interface_name)
+        if not interface:
+            raise FileNotFoundError(f"Interface {interface_name} not found.")
+        if interface.is_type_properties() or not interface.is_aggregation_object():
+            raise TypeError(
+                f"Unable to send data on {interface_name} as an object. The interface is "
+                f"not object aggregated."
+            )
+
+        for key, value in payload.items():
+            data_type = interface.get_mapping(f"{interface_path}/{key}").type
+            data_object[key] = utils.__value_to_astarte_type(value, data_type)
+
+        astarte_data = astarte_type.AstarteDataType(  # pylint: disable=no-member
+            astarte_object=data_object
+        )
+
+        astarte_timestamp = None
+        if timestamp:
+            t = timestamp.timestamp()
+            seconds = int(t)
+            nanos = int(t % 1 * 1e9)
+            astarte_timestamp = _timestamp_pb2.Timestamp(seconds=seconds, nanos=nanos)
+
+        message = astarte_message.AstarteMessage(  # pylint: disable=no-member
+            interface_name=interface_name,
+            path=interface_path,
+            astarte_data=astarte_data,
+            timestamp=astarte_timestamp,
+        )
+        self.__stub.Send(message)
+
+    def unset(self, interface_name, interface_path):
+        interface = self.__introspection.get_interface(interface_name)
+        if not interface:
+            raise FileNotFoundError(f"Interface {interface_name} not found.")
+        if not interface.is_type_properties():
+            raise TypeError(
+                f"Unable to unset {interface_name}/{interface_path}. The interface is datastream"
+            )
+
+        mapping = interface.get_mapping(interface_path)
+        if not mapping:
+            raise FileNotFoundError(f"Mapping {interface_name}/{interface_path} not found.")
+
+        message = astarte_message.AstarteMessage(  # pylint: disable=no-member
+            interface_name=interface_name,
+            path=interface_path,
+            astarte_unset=astarte_message.AstarteUnset()
+        )
+
+        self.__stub.Send(message)
